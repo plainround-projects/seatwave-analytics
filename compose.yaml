@@ -1,0 +1,99 @@
+# SeatWave's analytics stack for Module 31, under the Compose project name seatwave-analytics: one
+# Kafka broker in KRaft mode (also its own controller) and the topic setup. DuckDB, the warehouse,
+# runs inside the batch job's JVM, so it needs no container. The stream job, the publisher, the
+# archiver, the load and the reconciliation run on the host as plain java processes
+# (scripts/stack.sh), so that a run can kill the stream job by its process id.
+#
+# Image pinned by tag and digest, checked on Docker Hub on 13 November 2026 (pushed 22 October 2026,
+# amd64 and arm64): apache/kafka:4.4.0, the vendor's own image and Module 27's pin. Ports on
+# 127.0.0.1 only, from Module 31's range 23100 to 23199. Nothing runs privileged, nothing uses the
+# host network or the Docker socket, no capability is added, and no host folder is mounted.
+#
+# Memory: the Docker VM has 8 GB for every project on this machine, so this stack has ONE broker,
+# as Module 28's does: a 384 MB heap in a 768 MB container (exactly_once_v2 adds the transaction
+# log and the job's repartition and changelog topics to what it holds), plus 384 MB for kafka-init
+# while it runs. Replication is not shown here; Module 27 shows it.
+name: seatwave-analytics
+
+services:
+  kafka:
+    image: apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: 2
+    mem_limit: 768m
+    # A port that answers is enough here: kafka-init's commands wait for the broker itself.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "19092"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    environment:
+      # 16 bytes in base64, as kafka-storage.sh random-uuid prints it; the image formats the log
+      # folder with it on first start. An identifier, not a secret.
+      CLUSTER_ID: c2VhdHdhdmUtYW5hbHl0aWM
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://127.0.0.1:23192
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # One broker cannot hold three copies; exactly_once_v2 needs the transaction log settings
+      # too. Production keeps 3 (Module 27).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created on purpose by kafka-init; the job creates only its internal topics.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # The seeded on-sale is dated 20 November 2026, after the day this stack runs, and the job
+      # writes event time as the timestamp of its repartition, output and late records. Kafka 4
+      # refuses a timestamp more than an hour ahead of the broker's clock by default
+      # (log.message.timestamp.after.max.ms=3600000; seen on the first run), which a live on-sale
+      # never meets. 30 days lets the seeded day through; production keeps the default.
+      KAFKA_LOG_MESSAGE_TIMESTAMP_AFTER_MAX_MS: "2592000000"
+      KAFKA_HEAP_OPTS: -Xmx384m -Xms384m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:23192:9092"
+
+  # seatwave.bookings as Module 27 defined it (24 partitions, 7 days); the dashboard topic is
+  # compacted, so it keeps the latest count of each show and minute; the late topic keeps the
+  # confirms that came after their window's grace, for the batch's correction; the dead-letter
+  # topic keeps what the reader could not use.
+  kafka-init:
+    image: apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 384m
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_HEAP_OPTS: -Xmx128m
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        create() { /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create
+        --if-not-exists --replication-factor 1 --topic "$$1" --partitions "$$2" --config "$$3"; } &&
+        create seatwave.bookings 24 retention.ms=604800000 &&
+        create seatwave.analytics.sales-per-minute 6 cleanup.policy=compact &&
+        create seatwave.analytics.late-bookings 6 retention.ms=604800000 &&
+        create seatwave.bookings.dlq 1 retention.ms=604800000
+    restart: "no"
+
+volumes:
+  kafka-data:
